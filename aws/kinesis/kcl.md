@@ -322,27 +322,37 @@ KCL 3.x では worker 群の中から leader が一つ選ばれる。`DynamoDBLo
 leader 自身も通常の worker である。leader は自分に割り当てられた shard を処理でき、非 leader worker も自分の shard を同時に処理する。違いは、leader だけが「現在の worker と lease の状態を読み、次の lease 割当を書き込む」ことである。
 
 ```mermaid
-flowchart TB
-    Lock[(DynamoDB leader lock)]
-    LeaseTable[(DynamoDB Lease Table)]
-    Metrics[(Worker metrics / lease state)]
+sequenceDiagram
+    participant A as Worker A
+    participant B as Worker B
+    participant C as Worker C
+    participant Lock as DynamoDB leader lock
+    participant LAM as LeaseAssignmentManager
+    participant Lease as DynamoDB Lease Table
 
-    subgraph Fleet[KCL worker fleet]
-        WA[Worker A<br/>leader]
-        WB[Worker B<br/>non-leader]
-        WC[Worker C<br/>non-leader]
-    end
+    A->>Lock: leader lock を取得
+    Note over A: Worker A が leader になる
+    A->>LAM: assignment cycle を実行
+    LAM->>Lease: lease と worker 状態を読む
+    LAM->>Lease: owner を更新する
+    Lease-->>A: shard-0, shard-1 の lease
+    Lease-->>B: shard-2, shard-3 の lease
+    Lease-->>C: shard-4, shard-5 の lease
+    Note over A,C: leader / non-leader を問わず、各 worker が<br/>自分の lease の shard を処理する
+```
 
-    Lock -->|leader election| WA
-    WA -->|LeaseAssignmentManager<br/>load state and calculate assignment| Metrics
-    WA -->|write assignment| LeaseTable
-    LeaseTable -->|lease shard-0, shard-1| WA
-    LeaseTable -->|lease shard-2, shard-3| WB
-    LeaseTable -->|lease shard-4, shard-5| WC
+leader が行うのは上図の `assignment cycle` だけである。`LeaseAssignmentManager` は lease table から worker・lease の状態を読み、どの worker を owner にするかを更新する。record の取得と `ShardRecordProcessor` の実行は、owner になった全 worker がそれぞれ行う。
 
-    WA --> PA[process assigned records]
-    WB --> PB[process assigned records]
-    WC --> PC[process assigned records]
+```mermaid
+flowchart LR
+    A[Worker A<br/>leader] -->|controls assignment| LAM[LeaseAssignmentManager]
+    LAM --> Lease[(DynamoDB Lease Table)]
+    Lease -->|owns shard-0, shard-1| A
+    Lease -->|owns shard-2, shard-3| B[Worker B<br/>non-leader]
+    Lease -->|owns shard-4, shard-5| C[Worker C<br/>non-leader]
+    A -->|processes| S1[Kinesis shard-0, shard-1]
+    B -->|processes| S2[Kinesis shard-2, shard-3]
+    C -->|processes| S3[Kinesis shard-4, shard-5]
 ```
 
 | 用語 | 意味 | 誤解しやすい点 |
@@ -364,7 +374,7 @@ sequenceDiagram
     A->>DDB: leader lock を取得
     A->>LAM: lease assignment を実行
     Note over A,B: A と B はそれぞれの shard を並行処理
-    A-xDDB: Pod 終了または lock 喪失
+    Note over A,DDB: A が Pod 終了または leader lock を喪失
     Note over B: B は既存 lease の record 処理を継続
     B->>DDB: leader lock を取得
     B->>LAM: assignment を再開
