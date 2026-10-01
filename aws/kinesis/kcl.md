@@ -444,9 +444,9 @@ flowchart LR
 
 ### Q1. `processRecords()` で例外を投げると、KCL はどのように動作するか？
 
-A. KCL の `ProcessTask` は `ShardRecordProcessor.processRecords()` 呼び出しで発生したアプリケーション例外を捕捉し、失敗した record を示すログを残せる。その例外を「同じ batch を必ず再配信する要求」として扱うわけではない。task の lifecycle は継続し、後続の record batch が `processRecords()` に渡される可能性がある。
+A. **例外処理はアプリケーションの `processRecords()` 内で完結させる、というのが KCL の前提である。** AWS の公式ドキュメントは、`processRecords()` で発生する例外を record processor が処理することを求めている。例外を method の外へ出すと、KCL はその batch を「再試行要求」として扱わない。現在の KCL 3.x の `ProcessTask` は例外を捕捉し、`Skipping over the following data records` を error log に残して、その batch を再送せず後続処理へ進む。
 
-したがって、`throw` だけで同一 batch の自動再試行を期待してはいけない。特に危険なのは、失敗した batch の後で別 batch の処理が成功し、より大きい sequence number に checkpoint するケースである。checkpoint はその sequence 以下がすべて安全に処理済みであることを意味するため、未解決の失敗 record まで再開対象から外れてしまう。
+したがって、`throw` だけで同一 batch の自動再試行を期待してはいけない。例外を握りつぶすことも正解ではない。失敗を未解決のまま後続 batch の checkpoint を許可すると、checkpoint はその sequence 以下がすべて安全に処理済みであることを意味するため、未解決の失敗 record まで再開対象から外れてしまう。
 
 ```text
 checkpoint: 100
