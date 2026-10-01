@@ -181,6 +181,195 @@ sequenceDiagram
 | Spring `SmartLifecycle` | Spring context の start / stop phase で非同期 component の完了を callback として通知できる lifecycle API。 | running 状態、stop callback | KCL graceful shutdown を完了してから AWS SDK client を破棄するための管理点として使える。 |
 | Kubernetes | Pod に SIGTERM を送信し、`terminationGracePeriodSeconds` を過ぎても終了しない process を強制停止する。 | Pod の終了猶予時間 | 猶予時間は KCL の処理中 batch、最終 checkpoint、handoff に必要な時間より長く設定する。 |
 
+## 実行単位と包含関係
+
+KCL を理解するには、「何をデプロイするか」と「何が shard を処理するか」を分ける必要がある。もっとも一般的な Kubernetes 構成では、一つの Pod が一つの JVM process、一つの Spring application、一つの `Scheduler` を持つ。この `Scheduler` が `workerIdentifier` を持って KCL fleet に参加するため、実務上は **1 Pod = 1 KCL worker** と扱える。
+
+ただしこれは推奨される運用上の対応関係であり、概念上の同義語ではない。Pod は Kubernetes の配置・終了単位、`Scheduler` は Java の実行コンポーネント、KCL worker は `workerIdentifier` で識別されて lease に参加する論理的な参加者である。
+
+```mermaid
+flowchart TB
+    Deploy[Kubernetes Deployment<br/>desired replicas: 3]
+
+    subgraph Cluster[Kubernetes Cluster]
+        subgraph PodA[Pod A: deployment / restart unit]
+            JVMA[JVM process]
+            SpringA[Spring ApplicationContext]
+            SchedA[Scheduler Runnable<br/>workerIdentifier = worker-a]
+            JVMA --> SpringA --> SchedA
+        end
+        subgraph PodB[Pod B: deployment / restart unit]
+            JVMB[JVM process]
+            SpringB[Spring ApplicationContext]
+            SchedB[Scheduler Runnable<br/>workerIdentifier = worker-b]
+            JVMB --> SpringB --> SchedB
+        end
+        subgraph PodC[Pod C: deployment / restart unit]
+            JVMC[JVM process]
+            SpringC[Spring ApplicationContext]
+            SchedC[Scheduler Runnable<br/>workerIdentifier = worker-c]
+            JVMC --> SpringC --> SchedC
+        end
+    end
+
+    Deploy --> PodA
+    Deploy --> PodB
+    Deploy --> PodC
+
+    subgraph KCLFleet[KCL worker fleet: logical participants]
+        WA[Worker A]
+        WB[Worker B]
+        WC[Worker C]
+    end
+
+    SchedA -->|represents| WA
+    SchedB -->|represents| WB
+    SchedC -->|represents| WC
+
+    LeaseTable[(DynamoDB Lease Table)]
+    WA --> LeaseTable
+    WB --> LeaseTable
+    WC --> LeaseTable
+
+    WA --> CA[ShardConsumer x N]
+    WB --> CB[ShardConsumer x M]
+    WC --> CC[ShardConsumer x 0..K]
+    CA --> RP[ShardRecordProcessor]
+    CB --> RP
+    CC --> RP
+```
+
+| 階層 | 概念 | 主な責任 | この文書での見分け方 |
+|---|---|---|---|
+| 1 | Kubernetes Deployment | Pod の desired replica 数と rollout を管理する。 | 「何個の Pod を維持するか」を決める。 |
+| 2 | Pod | コンテナを実行し、SIGTERM と `terminationGracePeriodSeconds` の対象になる。 | Pod 再起動の説明ではこの単位を使う。 |
+| 3 | JVM process / Spring application | Java process とその bean・lifecycle を持つアプリケーション実行空間。 | `@PreDestroy`、`SmartLifecycle`、AWS SDK client の管理単位。 |
+| 4 | `Scheduler` | KCL の中心 `Runnable`。初期化、lease coordination、`ShardConsumer` の lifecycle、shutdown を統括する。 | `scheduler.run()` と `startGracefulShutdown()` の主体。 |
+| 5 | KCL worker | `workerIdentifier` で識別され、lease table を通じて shard を担当する論理的な fleet 参加者。通常は一つの `Scheduler` が一 worker を表す。 | 「どの worker が shard を所有するか」の単位。 |
+| 6 | lease | 特定 shard を処理する権利と checkpoint を保持する DynamoDB 上の状態。 | 排他所有と failover の単位。 |
+| 7 | `ShardConsumer` | 一つの lease、すなわち一つの shard の KCL lifecycle を実行する。 | shard ごとの `initialize` / `processRecords` / shutdown callback の主体。 |
+| 8 | `ShardRecordProcessor` | アプリケーションが実装する業務処理 callback。 | record を downstream に反映し、checkpoint 可否を判断する。 |
+
+### 最も一般的な対応関係
+
+```text
+Deployment (replicas = 3)
+  └─ Pod A / Pod B / Pod C
+       └─ JVM process
+            └─ Spring ApplicationContext
+                 └─ Scheduler
+                      └─ KCL worker (unique workerIdentifier)
+                           └─ 0..N leases
+                                └─ ShardConsumer per lease
+                                     └─ ShardRecordProcessor per shard
+```
+
+`workerIdentifier` は同時に動く KCL worker ごとに一意でなければならない。同じ identifier を複数 Pod で共有すると、同じ worker として扱われ、lease 管理が正しく動かない。通常は Pod UID のように再作成時にも重複しない値を使う。
+
+## worker と shard の割当
+
+KCL worker は、`Scheduler.run()` を実行している**一つの KCL 実行インスタンス**である。Kubernetes では通常「一つの Pod 内の一つの application process」が一 worker になるが、概念上 worker = Pod ではない。同一 Pod 内で複数 `Scheduler` を起動すれば複数 worker になり得るが、運用上は一 Pod 一 worker とするのが分かりやすい。
+
+KCL では shard の担当単位は `lease` である。worker は複数 lease を取得できるため、**一つの worker が複数 shard を処理できる**。一方、正常状態では一つの lease は一つの worker だけが所有するため、**同じ shard を二つの worker が同時に正規処理することはない**。
+
+```mermaid
+flowchart TB
+    LeaseTable[(DynamoDB<br/>Lease Table)]
+
+    subgraph W1[Worker A / Pod A]
+        A1[ShardConsumer A-0<br/>RecordProcessor]
+        A2[ShardConsumer A-1<br/>RecordProcessor]
+        A3[ShardConsumer A-2<br/>RecordProcessor]
+    end
+
+    subgraph W2[Worker B / Pod B]
+        B1[ShardConsumer B-0<br/>RecordProcessor]
+        B2[ShardConsumer B-1<br/>RecordProcessor]
+    end
+
+    subgraph W3[Worker C / Pod C]
+        C1[ShardConsumer C-0<br/>RecordProcessor]
+    end
+
+    LeaseTable -->|lease shard-0| A1
+    LeaseTable -->|lease shard-1| A2
+    LeaseTable -->|lease shard-2| A3
+    LeaseTable -->|lease shard-3| B1
+    LeaseTable -->|lease shard-4| B2
+    LeaseTable -->|lease shard-5| C1
+
+    A1 --> S0[Kinesis shard-0]
+    A2 --> S1[Kinesis shard-1]
+    A3 --> S2[Kinesis shard-2]
+    B1 --> S3[Kinesis shard-3]
+    B2 --> S4[Kinesis shard-4]
+    C1 --> S5[Kinesis shard-5]
+```
+
+この図では 6 shard を 3 worker に分けている。Worker A は 3 shard、Worker B は 2 shard、Worker C は 1 shard を担当する。実際の割当は worker metric、lease 数、再均衡の進行状況で変化するため、常に完全な均等配分になるとは限らない。
+
+| 状況 | 結果 |
+|---|---|
+| shard 4 個、worker 1 個 | 1 worker が最大 4 lease を持ち、4 shard を処理できる。 |
+| shard 4 個、worker 2 個 | KCL は lease を再均衡し、通常は各 worker が約 2 shard を担当する。 |
+| shard 4 個、worker 8 個 | 同時に正規処理できる shard は 4 個まで。残りの worker は lease を持たず idle になり得る。 |
+| worker が停止・lease renewal に失敗 | lease の有効期限後、別 worker が lease を取得して最後の checkpoint から再開する。checkpoint 前の処理は重複し得る。 |
+
+## leader worker と lease assignment
+
+KCL 3.x では worker 群の中から leader が一つ選ばれる。`DynamoDBLockBasedLeaderDecider` は DynamoDB の lock を使って leader を選出する。leader が担うのは `LeaseAssignmentManager` による **lease assignment の制御**であり、record を一手に処理する役割ではない。
+
+leader 自身も通常の worker である。leader は自分に割り当てられた shard を処理でき、非 leader worker も自分の shard を同時に処理する。違いは、leader だけが「現在の worker と lease の状態を読み、次の lease 割当を書き込む」ことである。
+
+```mermaid
+flowchart TB
+    Lock[(DynamoDB leader lock)]
+    LeaseTable[(DynamoDB Lease Table)]
+    Metrics[(Worker metrics / lease state)]
+
+    subgraph Fleet[KCL worker fleet]
+        WA[Worker A<br/>leader]
+        WB[Worker B<br/>non-leader]
+        WC[Worker C<br/>non-leader]
+    end
+
+    Lock -->|leader election| WA
+    WA -->|LeaseAssignmentManager<br/>load state and calculate assignment| Metrics
+    WA -->|write assignment| LeaseTable
+    LeaseTable -->|lease shard-0, shard-1| WA
+    LeaseTable -->|lease shard-2, shard-3| WB
+    LeaseTable -->|lease shard-4, shard-5| WC
+
+    WA --> PA[process assigned records]
+    WB --> PB[process assigned records]
+    WC --> PC[process assigned records]
+```
+
+| 用語 | 意味 | 誤解しやすい点 |
+|---|---|---|
+| worker | `Scheduler` を実行し、lease を取得して shard を処理する KCL 実行単位。 | Pod と同義ではない。通常の Kubernetes 運用では一 Pod 一 worker になりやすい。 |
+| leader worker | worker の一つ。lease assignment などの制御処理を担当する。 | leader だけが record を処理するわけではない。non-leader も割り当て済み shard を処理する。 |
+| `LeaseAssignmentManager` | leader でのみ assignment cycle を実行し、lease をどの worker に割り当てるか判断する。 | record の取得・業務処理を実行するコンポーネントではない。 |
+| leader lock | leader が一つだけになるための排他 lock。`DynamoDBLockBasedLeaderDecider` では DynamoDB を使う。 | shard lease とは別の概念。leader lock を持つことと、全 shard lease を持つことは別である。 |
+
+leader が停止したり lock を失ったりしても、すべての record 処理が直ちに停止するわけではない。既存 lease を持つ各 worker は処理を継続できる。一方で新しい assignment や再均衡は次の leader が選出されるまで遅延し得る。新 leader が選出されると、その worker が制御処理を引き継ぐ。
+
+```mermaid
+sequenceDiagram
+    participant A as Worker A (leader)
+    participant B as Worker B
+    participant DDB as DynamoDB leader lock
+    participant LAM as LeaseAssignmentManager
+
+    A->>DDB: leader lock を取得
+    A->>LAM: lease assignment を実行
+    Note over A,B: A と B はそれぞれの shard を並行処理
+    A-xDDB: Pod 終了または lock 喪失
+    Note over B: B は既存 lease の record 処理を継続
+    B->>DDB: leader lock を取得
+    B->>LAM: assignment を再開
+```
+
 ## 全体構成とレイヤー
 
 ```mermaid
